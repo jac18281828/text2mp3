@@ -94,13 +94,30 @@ def extract_metadata_from_filename(path: Path) -> BookMetadata:
     return BookMetadata(title=title)
 
 
+def _fix_roman_numerals_case(s: str) -> str:
+    """Fix Roman numerals that got lowercased by .title() - e.g. 'Chapter Ii' -> 'Chapter II'"""
+    def fix_roman(m):
+        word = m.group(0)
+        # Check if it's a valid Roman numeral pattern (but was title-cased)
+        upper = word.upper()
+        if re.fullmatch(r'[IVXLCDM]+', upper):
+            return upper
+        return word
+    return re.sub(r'\b[IVXLCDMivxlcdm]+\b', fix_roman, s)
+
+
 def normalize_headings(t: str) -> str:
     lines = t.splitlines()
     out = []
     for line in lines:
         s = line.strip()
         if s and len(s) < 80 and s.isupper():
-            out.append(s.title() + ":")
+            titled = _fix_roman_numerals_case(s.title())
+            # Don't add colon if line already ends with punctuation
+            if titled[-1] in '.,:;!?':
+                out.append(titled)
+            else:
+                out.append(titled + ":")
         else:
             out.append(line)
     return "\n".join(out)
@@ -335,7 +352,9 @@ def split_into_sections_smart(text: str, min_section_chars: int = 1500) -> list[
                 key = re.sub(r"\s+", " ", t.strip().upper())
                 if key not in seen:
                     seen.add(key)
-                    norm_titles.append(t.strip())
+                    # Strip trailing punctuation from title
+                    clean = t.strip().rstrip('.:,;')
+                    norm_titles.append(clean)
             title = " — ".join(norm_titles)
 
             blocks.append((start, j, title))
