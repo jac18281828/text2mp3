@@ -1,0 +1,4 @@
+piper-tts
+onnxruntime
+imageio-ffmpeg
+pypdf
