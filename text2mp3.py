@@ -7,6 +7,8 @@ Recommended run:
   OMP_NUM_THREADS=1 python3 text2mp3.py ... --workers 6 --split-chapters
 """
 
+from __future__ import annotations
+
 # ===================== Imports =====================
 
 import argparse
@@ -15,21 +17,42 @@ import re
 import sys
 import tempfile
 import subprocess
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
-from pypdf import PdfReader
-import imageio_ffmpeg
-
 
 # ===================== Text loading =====================
+
+
+class Text2Mp3Error(Exception):
+    """Base class for operational CLI errors."""
+
+
+class DependencyError(Text2Mp3Error):
+    """Raised when an optional runtime dependency is unavailable."""
+
+
+class SynthesisError(Text2Mp3Error):
+    """Raised when Piper synthesis fails."""
+
+
+_WORKER_VOICE = None
+_WORKER_VOICE_MODEL: str | None = None
 
 def read_text_from_txt(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def read_text_from_pdf(path: Path, start_page: int | None, end_page: int | None) -> str:
+    try:
+        from pypdf import PdfReader
+    except ModuleNotFoundError as exc:
+        raise DependencyError(
+            "PDF input requires the `pypdf` package in the active Python environment."
+        ) from exc
+
     reader = PdfReader(str(path))
     n = len(reader.pages)
     s = max(1, start_page) if start_page else 1
@@ -41,6 +64,25 @@ def normalize_whitespace(t: str) -> str:
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
+
+
+def require_existing_file(parser: argparse.ArgumentParser, value: str, label: str) -> Path:
+    path = Path(value)
+    if not path.exists():
+        parser.error(f"{label} not found: {path}")
+    if not path.is_file():
+        parser.error(f"{label} is not a file: {path}")
+    return path
+
+
+def require_piper_model_files(parser: argparse.ArgumentParser, value: str) -> Path:
+    model_path = require_existing_file(parser, value, "model file")
+    config_path = Path(f"{model_path}.json")
+    if not config_path.exists():
+        parser.error(f"model config file not found: {config_path}")
+    if not config_path.is_file():
+        parser.error(f"model config path is not a file: {config_path}")
+    return model_path
 
 
 # ===================== Metadata extraction =====================
@@ -301,6 +343,26 @@ def _is_all_caps_title_line(s: str) -> bool:
     upper = sum(1 for c in letters if c.isupper())
     return upper / len(letters) >= 0.9
 
+
+def _looks_like_standalone_heading(lines: list[str], idx: int) -> bool:
+    s = lines[idx].strip()
+    if not s:
+        return False
+
+    prev_blank = idx == 0 or not lines[idx - 1].strip()
+    next_blank = idx == len(lines) - 1 or not lines[idx + 1].strip()
+
+    if _HEADING_LINE_RE.match(s):
+        return prev_blank or next_blank
+
+    if not _HEADING_INLINE_RE.match(s):
+        return False
+
+    if not (prev_blank or next_blank):
+        return False
+
+    return len(s) <= 120 and not re.search(r"[,;!?]\s*$", s)
+
 def split_into_sections_smart(text: str, min_section_chars: int = 1500) -> list[Section]:
     """
     Gutenberg-friendly:
@@ -320,7 +382,7 @@ def split_into_sections_smart(text: str, min_section_chars: int = 1500) -> list[
             i += 1
             continue
 
-        if _HEADING_INLINE_RE.match(s) or _HEADING_LINE_RE.match(s):
+        if _looks_like_standalone_heading(lines, i):
             start = i
             titles = [s]
 
@@ -366,6 +428,10 @@ def split_into_sections_smart(text: str, min_section_chars: int = 1500) -> list[
         return [Section("FULL_TEXT", text.strip())]
 
     sections: list[Section] = []
+    intro = "\n".join(lines[:blocks[0][0]]).strip()
+    if intro:
+        sections.append(Section(title="FRONT_MATTER", text=intro))
+
     for idx, (b_start, b_end, title) in enumerate(blocks):
         next_start = blocks[idx + 1][0] if idx + 1 < len(blocks) else n
         body = "\n".join(lines[b_end:next_start]).strip()
@@ -396,17 +462,46 @@ def split_into_sections_smart(text: str, min_section_chars: int = 1500) -> list[
 # ===================== Piper synthesis =====================
 
 def synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw):
-    cmd = [
-        sys.executable, "-m", "piper",
-        "-m", model,
-        "-f", wav,
-        "--length_scale", str(ls),
-        "--noise_scale", str(ns),
-        "--noise_w", str(nw),
-    ]
-    if speaker is not None:
-        cmd += ["-s", str(speaker)]
-    subprocess.run(cmd, input=text.encode(), check=True)
+    global _WORKER_VOICE, _WORKER_VOICE_MODEL
+
+    model_key = str(Path(model).resolve())
+    if _WORKER_VOICE is None or _WORKER_VOICE_MODEL != model_key:
+        try:
+            from piper import PiperVoice
+        except ModuleNotFoundError as exc:
+            raise DependencyError(
+                f"Piper synthesis dependency is missing from the active Python environment: {exc.name}"
+            ) from exc
+
+        try:
+            _WORKER_VOICE = PiperVoice.load(model_key)
+        except FileNotFoundError as exc:
+            missing_path = exc.filename or f"{model_key}.json"
+            raise SynthesisError(f"Piper model asset not found: {missing_path}") from exc
+        except Exception as exc:
+            raise SynthesisError(f"Failed to load Piper model '{model_key}': {exc}") from exc
+
+        _WORKER_VOICE_MODEL = model_key
+
+    try:
+        from piper import SynthesisConfig
+    except ModuleNotFoundError as exc:
+        raise DependencyError(
+            f"Piper synthesis dependency is missing from the active Python environment: {exc.name}"
+        ) from exc
+
+    syn_config = SynthesisConfig(
+        speaker_id=speaker,
+        length_scale=ls,
+        noise_scale=ns,
+        noise_w_scale=nw,
+    )
+
+    try:
+        with wave.open(str(wav), "wb") as wav_file:
+            _WORKER_VOICE.synthesize_wav(text, wav_file, syn_config=syn_config)
+    except Exception as exc:
+        raise SynthesisError(f"Piper synthesis failed for chunk '{Path(wav).name}': {exc}") from exc
 
 
 def _synth_worker(job):
@@ -415,9 +510,35 @@ def _synth_worker(job):
     return i, wav
 
 
+def run_synthesis_jobs(jobs, workers):
+    if workers <= 1:
+        return [_synth_worker(job) for job in jobs]
+
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(_synth_worker, jobs))
+    except Text2Mp3Error:
+        raise
+    except (PermissionError, OSError) as exc:
+        if getattr(exc, "errno", None) == 1:
+            print("Multiprocessing unavailable; falling back to single-worker synthesis.",
+                  file=sys.stderr)
+            return [_synth_worker(job) for job in jobs]
+        raise SynthesisError(f"Synthesis failed: {exc}") from exc
+    except Exception as exc:
+        raise SynthesisError(f"Synthesis failed: {exc}") from exc
+
+
 # ===================== Audio concat =====================
 
 def ffmpeg_path() -> str:
+    try:
+        import imageio_ffmpeg
+    except ModuleNotFoundError as exc:
+        raise DependencyError(
+            "Audio conversion requires the `imageio-ffmpeg` package in the active Python environment."
+        ) from exc
+
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
@@ -432,7 +553,9 @@ def make_silence(out, ms):
     )
 
 
-def concat_to_mp3(wavs, out_mp3, bitrate):
+def concat_to_mp3(wavs, out_mp3, bitrate, metadata: BookMetadata | None = None,
+                  track_num: int | None = None, track_total: int | None = None,
+                  chapter_title: str | None = None):
     ff = ffmpeg_path()
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -456,10 +579,34 @@ def concat_to_mp3(wavs, out_mp3, bitrate):
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
 
-        subprocess.run(
-            [ff, "-y", "-i", concat, "-b:a", bitrate, out_mp3],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        # Build ffmpeg command with ID3 tags
+        cmd = [ff, "-y", "-i", concat, "-b:a", bitrate]
+        
+        # Add ID3 metadata tags
+        if chapter_title:
+            cmd.extend(["-metadata", f"title={chapter_title}"])
+        elif metadata and metadata.title:
+            cmd.extend(["-metadata", f"title={metadata.title}"])
+        
+        if metadata:
+            if metadata.author:
+                cmd.extend(["-metadata", f"artist={metadata.author}"])
+                cmd.extend(["-metadata", f"album_artist={metadata.author}"])
+            if metadata.title:
+                cmd.extend(["-metadata", f"album={metadata.title}"])
+            if metadata.year:
+                cmd.extend(["-metadata", f"date={metadata.year}"])
+        
+        cmd.extend(["-metadata", "genre=Audiobook"])
+        
+        if track_num is not None:
+            if track_total is not None:
+                cmd.extend(["-metadata", f"track={track_num}/{track_total}"])
+            else:
+                cmd.extend(["-metadata", f"track={track_num}"])
+        
+        cmd.append(out_mp3)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def write_m3u_playlist(mp3_files: list[tuple[Path, str]], m3u_path: Path):
@@ -524,6 +671,13 @@ def create_m4b_audiobook(chapter_wavs: list[tuple[Path, str]], m4b_path: Path, b
     chapter_wavs: list of (wav_path, chapter_title)
     metadata: optional BookMetadata for title/author tags
     """
+    try:
+        from mutagen.mp4 import MP4
+    except ModuleNotFoundError as exc:
+        raise DependencyError(
+            "Creating audiobook output requires the `mutagen` package in the active Python environment."
+        ) from exc
+
     ff = ffmpeg_path()
     
     with tempfile.TemporaryDirectory() as td:
@@ -585,6 +739,14 @@ def create_m4b_audiobook(chapter_wavs: list[tuple[Path, str]], m4b_path: Path, b
              str(m4b_path)],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        
+        # Set mediakind to Audiobook using mutagen (stik atom)
+        # stik value 2 = Audiobook in iTunes/Apple Books
+        audio = MP4(str(m4b_path))
+        audio["stik"] = [2]  # 2 = Audiobook
+        audio.save()
+        print(f"  Media kind set to Audiobook")
+        
         print(f"Audiobook created: {m4b_path}")
 
 
@@ -613,106 +775,121 @@ def main():
     ap.add_argument("--end-page", type=int)
     args = ap.parse_args()
 
-    inp = Path(args.input)
-    if inp.suffix.lower() == ".pdf":
-        raw_text = read_text_from_pdf(inp, args.start_page, args.end_page)
-    else:
-        raw_text = read_text_from_txt(inp)
+    try:
+        inp = require_existing_file(ap, args.input, "input file")
+        model_path = require_piper_model_files(ap, args.model)
 
-    # Extract metadata before normalizing text
-    metadata = extract_gutenberg_metadata(raw_text)
-    if not metadata.title:
-        metadata = extract_metadata_from_filename(inp)
+        if inp.suffix.lower() == ".pdf":
+            raw_text = read_text_from_pdf(inp, args.start_page, args.end_page)
+        else:
+            raw_text = read_text_from_txt(inp)
 
-    text = normalize_headings(normalize_whitespace(raw_text))
-    text = convert_roman_numerals(text)
+        # Extract metadata before normalizing text
+        metadata = extract_gutenberg_metadata(raw_text)
+        if not metadata.title:
+            metadata = extract_metadata_from_filename(inp)
 
-    # Always detect chapters for metadata, but may not split output files
-    sections = split_into_sections_smart(text)
+        text = normalize_headings(normalize_whitespace(raw_text))
+        text = convert_roman_numerals(text)
 
-    base = Path(args.output)
-    pattern = args.output_pattern or str(base.with_name(base.stem + "_%03d" + base.suffix))
+        # Always detect chapters for metadata, but may not split output files
+        sections = split_into_sections_smart(text)
 
-    # For audiobook mode: produce single m4b with chapter markers
-    if args.audiobook:
-        m4b_path = base.with_suffix(".m4b")
-        
-        # Use a persistent temp directory for all chapter WAVs
-        with tempfile.TemporaryDirectory() as master_td:
-            master_td = Path(master_td)
-            chapter_wavs: list[tuple[Path, str]] = []  # (chapter_wav, title)
-            
+        base = Path(args.output)
+        pattern = args.output_pattern or str(base.with_name(base.stem + "_%03d" + base.suffix))
+
+        # For audiobook mode: produce single m4b with chapter markers
+        if args.audiobook:
+            m4b_path = base.with_suffix(".m4b")
+
+            # Use a persistent temp directory for all chapter WAVs
+            with tempfile.TemporaryDirectory() as master_td:
+                master_td = Path(master_td)
+                chapter_wavs: list[tuple[Path, str]] = []  # (chapter_wav, title)
+
+                for idx, sec in enumerate(sections, 1):
+                    print(f"[chapter {idx}/{len(sections)}] {sec.title}")
+
+                    chunks = chunk_text(sec.text, args.max_chars)
+                    wavs = []
+
+                    chapter_td = master_td / f"ch_{idx:03d}"
+                    chapter_td.mkdir()
+
+                    jobs = []
+                    for i, ch in enumerate(chunks, 1):
+                        wav = chapter_td / f"p_{i:04d}.wav"
+                        jobs.append((i, ch.text, str(model_path), str(wav),
+                                     args.speaker, args.length_scale,
+                                     args.noise_scale, args.noise_w))
+
+                    workers = min(args.workers, os.cpu_count() or 8)
+                    results = run_synthesis_jobs(jobs, workers)
+
+                    results.sort()
+                    for i, w in results:
+                        wavs.append((w, chunks[i-1].pause_ms))
+
+                    # Concatenate chunks into single chapter WAV
+                    chapter_wav = master_td / f"chapter_{idx:03d}.wav"
+                    concat_wavs_to_single(wavs, chapter_wav)
+                    chapter_wavs.append((chapter_wav, sec.title))
+
+                # Create m4b with chapter metadata
+                create_m4b_audiobook(chapter_wavs, m4b_path, args.bitrate, metadata)
+
+        else:
+            # Standard mode: produce MP3 files (one per chapter if split, or single file)
+            if not args.split_chapters:
+                sections = [Section("FULL_TEXT", text)]
+
+            generated_mp3s: list[tuple[Path, str]] = []
+
             for idx, sec in enumerate(sections, 1):
-                print(f"[chapter {idx}/{len(sections)}] {sec.title}")
-                
+                if len(sections) == 1 and not args.output_pattern:
+                    out_mp3 = base
+                else:
+                    out_mp3 = Path(pattern % idx)
+                print(f"[section {idx}/{len(sections)}] {sec.title}")
+
                 chunks = chunk_text(sec.text, args.max_chars)
                 wavs = []
-                
-                chapter_td = master_td / f"ch_{idx:03d}"
-                chapter_td.mkdir()
-                
-                jobs = []
-                for i, ch in enumerate(chunks, 1):
-                    wav = chapter_td / f"p_{i:04d}.wav"
-                    jobs.append((i, ch.text, args.model, str(wav),
-                                 args.speaker, args.length_scale,
-                                 args.noise_scale, args.noise_w))
-                
-                workers = min(args.workers, os.cpu_count() or 8)
-                with ProcessPoolExecutor(max_workers=workers) as ex:
-                    results = list(ex.map(_synth_worker, jobs))
-                
-                results.sort()
-                for i, w in results:
-                    wavs.append((w, chunks[i-1].pause_ms))
-                
-                # Concatenate chunks into single chapter WAV
-                chapter_wav = master_td / f"chapter_{idx:03d}.wav"
-                concat_wavs_to_single(wavs, chapter_wav)
-                chapter_wavs.append((chapter_wav, sec.title))
-            
-            # Create m4b with chapter metadata
-            create_m4b_audiobook(chapter_wavs, m4b_path, args.bitrate, metadata)
-    
-    else:
-        # Standard mode: produce MP3 files (one per chapter if split, or single file)
-        if not args.split_chapters:
-            sections = [Section("FULL_TEXT", text)]
-        
-        generated_mp3s: list[tuple[Path, str]] = []
-        
-        for idx, sec in enumerate(sections, 1):
-            out_mp3 = Path(pattern % idx)
-            print(f"[section {idx}/{len(sections)}] {sec.title}")
-            
-            chunks = chunk_text(sec.text, args.max_chars)
-            wavs = []
-            
-            with tempfile.TemporaryDirectory() as td:
-                td = Path(td)
-                jobs = []
-                for i, ch in enumerate(chunks, 1):
-                    wav = td / f"p_{i:04d}.wav"
-                    jobs.append((i, ch.text, args.model, str(wav),
-                                 args.speaker, args.length_scale,
-                                 args.noise_scale, args.noise_w))
-                
-                workers = min(args.workers, os.cpu_count() or 8)
-                with ProcessPoolExecutor(max_workers=workers) as ex:
-                    results = list(ex.map(_synth_worker, jobs))
-                
-                results.sort()
-                for i, w in results:
-                    wavs.append((w, chunks[i-1].pause_ms))
-                
-                concat_to_mp3(wavs, out_mp3, args.bitrate)
-            
-            generated_mp3s.append((out_mp3, sec.title))
-        
-        # Write m3u playlist if we have multiple chapters
-        if args.split_chapters and len(generated_mp3s) > 1:
-            m3u_path = base.with_suffix(".m3u")
-            write_m3u_playlist(generated_mp3s, m3u_path)
+
+                with tempfile.TemporaryDirectory() as td:
+                    td = Path(td)
+                    jobs = []
+                    for i, ch in enumerate(chunks, 1):
+                        wav = td / f"p_{i:04d}.wav"
+                        jobs.append((i, ch.text, str(model_path), str(wav),
+                                     args.speaker, args.length_scale,
+                                     args.noise_scale, args.noise_w))
+
+                    workers = min(args.workers, os.cpu_count() or 8)
+                    results = run_synthesis_jobs(jobs, workers)
+
+                    results.sort()
+                    for i, w in results:
+                        wavs.append((w, chunks[i-1].pause_ms))
+
+                    concat_to_mp3(wavs, out_mp3, args.bitrate,
+                                  metadata=metadata,
+                                  track_num=idx,
+                                  track_total=len(sections),
+                                  chapter_title=sec.title)
+
+                generated_mp3s.append((out_mp3, sec.title))
+
+            # Write m3u playlist if we have multiple chapters
+            if args.split_chapters and len(generated_mp3s) > 1:
+                m3u_path = base.with_suffix(".m3u")
+                write_m3u_playlist(generated_mp3s, m3u_path)
+    except Text2Mp3Error as exc:
+        ap.exit(1, f"Error: {exc}\n")
+    except subprocess.CalledProcessError as exc:
+        ap.exit(1, f"Error: external command failed with exit code {exc.returncode}: {exc.cmd}\n")
+    except FileNotFoundError as exc:
+        missing_path = exc.filename or str(exc)
+        ap.exit(1, f"Error: file not found: {missing_path}\n")
 
 
 if __name__ == "__main__":
