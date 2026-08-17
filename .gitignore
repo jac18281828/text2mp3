@@ -1,0 +1,30 @@
+# Generated audio/output
+*.m4b
+*.mp3
+*.wav
+*_mp3/
+*.m3u
+
+# Voice models (large binaries, fetched separately)
+models/
+
+# Book sources and derived text (copyright-sensitive; keep local only)
+*.pdf
+*.html
+Fellowship_of_the_Ring.txt
+TheMurderofRogerckroyd_Agatha_Christie.txt
+Who_Goes_There_John_W_Campbell.txt
+Chapter*_sample.txt
+TheFellowshipOfTheRing.jpg
+
+# Scratch / logs / caches
+*.log
+__pycache__/
+.DS_Store
+work/
+
+# Scripts not part of this gist's tracked scope
+librivox2m4b.py
+render_section.py
+prep_fellowship.py
+test_text2mp3.py
