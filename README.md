@@ -92,13 +92,32 @@ python3 text2mp3.py \
 
 ## Recommended Settings (Audiobook Style)
 
+These are now the tool's defaults (as of the Cori-high tuning pass), so you
+only need to pass them explicitly if you want something different:
+
 ```bash
---max-chars 4500 \
---length-scale 1.05 \
+--max-chars 600 \
+--length-scale 1.20 \
 --noise-scale 0.6 \
 --noise-w 0.75 \
---bitrate 192k
+--volume 1.4 \
+--bitrate 160k
 ```
+
+> 160k is the ceiling for MP3 at these voices' 22.05kHz sample rate (the
+> MPEG-2 LSF format has no higher option below 32kHz) -- `text2mp3.py`
+> clamps anything higher to 160k automatically, so requesting more doesn't
+> do anything.
+>
+> `--max-chars 600` trades a few more chunk splices (invisible now that
+> edges are fade-smoothed) for a real, measured reduction in the rate of
+> the occasional dropped/slurred word neural TTS models are prone to on
+> longer input sequences -- a known general limitation of VITS-style
+> models, not something this pipeline can fully eliminate.
+>
+> `--volume 1.4` exists because `normalize_audio` is off by default (it
+> was flattening natural loudness variation across chunks); this brings
+> the level back up without reintroducing that flattening.
 
 ---
 

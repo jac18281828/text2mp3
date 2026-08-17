@@ -2,3 +2,6 @@ piper-tts
 onnxruntime
 imageio-ffmpeg
 pypdf
+mutagen
+requests
+feedparser

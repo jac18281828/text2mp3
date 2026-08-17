@@ -12,6 +12,7 @@ from __future__ import annotations
 # ===================== Imports =====================
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -83,6 +84,21 @@ def require_piper_model_files(parser: argparse.ArgumentParser, value: str) -> Pa
     if not config_path.is_file():
         parser.error(f"model config path is not a file: {config_path}")
     return model_path
+
+
+def clamp_bitrate_for_sample_rate(bitrate: str, sample_rate: int) -> str:
+    """MP3 below 32kHz sample rate uses the MPEG-2 LSF format, which tops out
+    at 160kbps -- ffmpeg/LAME silently clamp any higher request to it. Match
+    what we ask for to what will actually be produced."""
+    m = re.match(r"^(\d+)k$", bitrate.strip(), re.IGNORECASE)
+    if not m or sample_rate >= 32000:
+        return bitrate
+    kbps = int(m.group(1))
+    if kbps <= 160:
+        return bitrate
+    print(f"Note: {bitrate} exceeds the 160k MP3 ceiling at {sample_rate}Hz "
+          f"(MPEG-2 LSF) -- using 160k, which is what would be produced anyway.")
+    return "160k"
 
 
 # ===================== Metadata extraction =====================
@@ -214,8 +230,310 @@ def convert_roman_numerals(t: str) -> str:
     
     # Second pass: lowercase (less common but possible: "chapter iv")
     t = re.sub(roman_pattern, _roman_replacer, t, flags=re.IGNORECASE)
-    
+
     return t
+
+
+# ===================== Cardinal words (for spoken chapter headings) =====================
+
+_ONES = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen",
+]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+_WORD_TO_INT = {
+    "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5, "SIX": 6, "SEVEN": 7,
+    "EIGHT": 8, "NINE": 9, "TEN": 10, "ELEVEN": 11, "TWELVE": 12, "THIRTEEN": 13,
+    "FOURTEEN": 14, "FIFTEEN": 15, "SIXTEEN": 16, "SEVENTEEN": 17, "EIGHTEEN": 18,
+    "NINETEEN": 19, "TWENTY": 20,
+}
+
+
+def int_to_cardinal_words(n: int) -> str:
+    """0-99 -> English words, e.g. 27 -> 'twenty-seven'. Falls back to str() beyond."""
+    if n < 0 or n >= 100:
+        return str(n)
+    if n < 20:
+        return _ONES[n]
+    tens, ones = divmod(n, 10)
+    return _TENS[tens] if ones == 0 else f"{_TENS[tens]}-{_ONES[ones]}"
+
+
+# ===================== Title casing =====================
+
+_SMALL_WORDS = {
+    "a", "an", "the", "and", "but", "or", "nor", "for", "at", "by", "in", "of",
+    "on", "to", "up", "as", "is", "it", "with",
+}
+
+
+def _cap_token(w: str) -> str:
+    """Capitalize first letter, leave the rest (so possessives stay 'King's', not 'King'S')."""
+    return (w[:1].upper() + w[1:]) if w else w
+
+
+def smart_title(s: str) -> str:
+    """Title-case a heading without mangling possessives or shouting small words."""
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return s
+    words = s.split(" ")
+    out = []
+    for i, w in enumerate(words):
+        lw = w.lower()
+        if 0 < i < len(words) - 1 and lw in _SMALL_WORDS:
+            out.append(lw)
+        else:
+            out.append(_cap_token(lw))
+    return " ".join(out)
+
+
+# ===================== Gutenberg / TTS text cleaning =====================
+
+def strip_gutenberg_boilerplate(text: str) -> str:
+    """Drop everything before '*** START OF ... PROJECT GUTENBERG ...' and from
+    '*** END OF ...' onward, removing the PG header and the license footer."""
+    start = re.search(r"^\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG.*$",
+                      text, re.IGNORECASE | re.MULTILINE)
+    end = re.search(r"^\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG.*$",
+                    text, re.IGNORECASE | re.MULTILINE)
+    s = start.end() if start else 0
+    e = end.start() if end else len(text)
+    return text[s:e].strip()
+
+
+def strip_page_numbers(text: str, max_page: int = 303) -> str:
+    """Remove inline print page numbers fused to a word with no space (e.g. 'One2',
+    'myself4', 'presumably)6'). Only strips a 1-3 digit run that is glued directly to a
+    letter or ')', is followed by whitespace/sentence punctuation, and is <= max_page.
+    Leaves legitimate inline numbers alone (16th, 7.30, twenty-one, 'No. 1', '(1)')."""
+    def repl(m: re.Match) -> str:
+        prefix, digits = m.group(1), m.group(2)
+        return prefix if int(digits) <= max_page else m.group(0)
+    return re.sub(r"([A-Za-z\)])(\d{1,3})(?=[\s.,;:!?]|$)", repl, text)
+
+
+def strip_scene_breaks(text: str) -> str:
+    """Replace asterisk scene-dividers ('***', '* * *', '* * * * *'), markdown rules
+    ('---'), and any stray PG START/END lines with a blank line (paragraph break)."""
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and "*" in s and re.fullmatch(r"[*\s]+", s):
+            out.append("")
+            continue
+        if re.fullmatch(r"-{3,}", s):
+            out.append("")
+            continue
+        if re.match(r"\*\*\*\s*(START|END) OF (?:THE|THIS) PROJECT GUTENBERG", s, re.IGNORECASE):
+            out.append("")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def strip_italic_underscores(text: str) -> str:
+    """Remove the underscore characters Gutenberg uses to mark italics (_word_)."""
+    return text.replace("_", "")
+
+
+def strip_illustrations(text: str) -> str:
+    """Drop '[Illustration ...]' blocks (figures, ASCII maps/diagrams) — meaningless as
+    audio. Handles single-line captions and multi-line blocks that close with a lone ']'
+    (the diagrams themselves contain stray ']' characters, so we can't match on ']'
+    alone — we terminate only on a line that is just ']')."""
+    lines = text.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if s.startswith("[Illustration"):
+            # Self-contained on one line, e.g. '[Illustration]' or '[Illustration: x]'
+            if s.endswith("]") and s.count("[") <= s.count("]"):
+                i += 1
+                continue
+            # Multi-line block: skip until a line that is exactly ']'
+            i += 1
+            while i < n and lines[i].strip() != "]":
+                i += 1
+            i += 1  # consume the closing ']'
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+# Box-drawing / rule characters that must never reach the synthesizer
+_DECOR_CHARS = "=+|‖"
+
+
+def strip_decorations(text: str) -> str:
+    """Strip ASCII box-drawing and rule decoration (e.g. the publisher's advertising
+    boxes in the back matter) so '=', '|', '‖', '+' are never spoken, while keeping the
+    actual text inside the boxes."""
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        # Drop lines that are nothing but box-drawing/rule characters
+        if s and re.fullmatch(r"[=+\-|‖/\\*.\s]+", s) and re.search(r"[=+|‖]", s):
+            out.append("")
+            continue
+        out.append(line)
+    text = "\n".join(out)
+    # Remove any residual decoration characters left on content lines (box sides, etc.)
+    text = re.sub(r"[=|‖]", " ", text)
+    text = re.sub(r"(?<!\w)\++(?!\w)", " ", text)
+    return text
+
+
+def clean_body_for_tts(text: str) -> str:
+    """Full body cleanup for narration: illustrations, box decoration, scene breaks,
+    page numbers, italics, whitespace."""
+    text = strip_illustrations(text)
+    text = strip_decorations(text)
+    text = strip_scene_breaks(text)
+    text = strip_page_numbers(text)
+    text = strip_italic_underscores(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ===================== Chapter heading parsing =====================
+
+def parse_chapter_label(token: str) -> int | None:
+    """'V' -> 5, '27' -> 27, 'FIVE' -> 5. Returns None if not a chapter number."""
+    token = token.strip().rstrip(".:").upper()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    roman = roman_to_int(token)
+    if roman is not None:
+        return roman
+    return _WORD_TO_INT.get(token)
+
+
+def split_chapter_title(full_title: str) -> tuple[int | None, str]:
+    """Parse a section title like 'CHAPTER V — MURDER' into (5, 'MURDER').
+    Returns (None, full_title) when there is no CHAPTER/BOOK/PART label."""
+    parts = re.split(r"\s*—\s*", full_title)
+    head = parts[0].strip()
+    m = re.match(r"^(?:CHAPTER|BOOK|PART)\s+(.+)$", head, re.IGNORECASE)
+    if not m:
+        return None, full_title
+    num = parse_chapter_label(m.group(1))
+    title = " ".join(p.strip() for p in parts[1:]).strip()
+    return num, title
+
+
+def build_spoken_heading(num: int, title: str) -> str:
+    """Spoken chapter intro, e.g. (5, 'Murder') -> 'Chapter Five. Murder.'"""
+    words = int_to_cardinal_words(num).capitalize()
+    if title:
+        return f"Chapter {words}. {ensure_terminal_punct(title)}"
+    return f"Chapter {words}."
+
+
+def build_chapter_marker(num: int, title: str) -> str:
+    """m4b/ID3 chapter marker, e.g. (5, 'Murder') -> 'Chapter 5: Murder'."""
+    return f"Chapter {num}: {title}" if title else f"Chapter {num}"
+
+
+def extract_dedication(text: str) -> str | None:
+    """Pull the dedication (last paragraph before CONTENTS) out of front matter."""
+    m = re.search(r"(.*?)\n\s*CONTENTS\b", text, re.IGNORECASE | re.DOTALL)
+    region = m.group(1) if m else text[:4000]
+    paras = [p.strip() for p in re.split(r"\n\s*\n", region) if p.strip()]
+    if not paras:
+        return None
+    ded = paras[-1]
+    if re.search(r"GUTENBERG|COPYRIGHT|DODD|GROSSET|PUBLISHERS|ILLUSTRATION|AUTHOR OF",
+                 ded, re.IGNORECASE):
+        return None
+    return re.sub(r"\s+", " ", ded).strip()
+
+
+def build_intro(metadata: "BookMetadata", dedication: str | None, mode: str) -> str:
+    """Compose the spoken opening that replaces the PG boilerplate / title page / TOC."""
+    title = smart_title(metadata.title) if metadata.title else "This book"
+    if metadata.author:
+        parts = [f"{title}. By {metadata.author}."]
+    else:
+        parts = [f"{title}."]
+    if mode == "dedication" and dedication:
+        parts.append(dedication)
+    elif mode == "note":
+        parts.append("This is a synthetic text-to-speech reading, produced from the "
+                     "public-domain Project Gutenberg edition.")
+    return "\n\n".join(parts)
+
+
+def _is_front_matter_title(title: str) -> bool:
+    """True for front-matter/TOC sections that should be dropped from narration.
+    Real chapter titles never contain CONTENTS/FRONT_MATTER, but a merged front-matter
+    block can contain the word CHAPTER (from the 'CHAPTER ... PAGE' TOC header), so we
+    key off the front-matter markers directly rather than the presence of CHAPTER."""
+    t = title.upper()
+    return any(k in t for k in ("FRONT_MATTER", "CONTENTS", "ILLUSTRATIONS", "LIST OF"))
+
+
+# Headings that mark the start of actual narrative content (NOT front matter such as
+# CONTENTS / DEDICATION / LIST OF ILLUSTRATIONS).
+_CONTENT_HEADING_RE = re.compile(
+    r"^(CHAPTER|BOOK|PART|PROLOGUE|PREFACE|FOREWORD|INTRODUCTION)\b", re.IGNORECASE)
+
+
+def _find_narrative_start(lines: list[str]) -> int:
+    """Index of the first standalone *content* heading. Everything before it (title page,
+    table of contents, dedication) is front matter. Returns 0 if none is found."""
+    for i in range(len(lines)):
+        if _looks_like_standalone_heading(lines, i) and \
+                _CONTENT_HEADING_RE.match(lines[i].strip()):
+            return i
+    return 0
+
+
+def prepare_sections(raw_text: str, metadata: "BookMetadata",
+                     intro_mode: str = "title") -> list["Section"]:
+    """Build narration-ready sections: strip boilerplate, drop front matter/TOC,
+    give each chapter a spoken heading + clean marker, and clean each body."""
+    stripped = strip_gutenberg_boilerplate(raw_text)
+    norm = re.sub(r"[ \t]+", " ", stripped)
+    norm = re.sub(r"\n{3,}", "\n\n", norm).strip()
+
+    # Separate front matter (title page / TOC / dedication) from the narrative BEFORE
+    # splitting, so a tiny TOC can never merge forward into (and swallow) chapter 1.
+    lines = norm.split("\n")
+    start = _find_narrative_start(lines)
+    front_text = "\n".join(lines[:start])
+    narrative = "\n".join(lines[start:]).strip() or norm
+
+    raw_sections = split_into_sections_smart(narrative)
+
+    out: list[Section] = []
+    if metadata.title:
+        dedication = extract_dedication(front_text or norm) if intro_mode != "none" else None
+        out.append(Section(title="Introduction",
+                            text=build_intro(metadata, dedication, intro_mode)))
+
+    for sec in raw_sections:
+        if _is_front_matter_title(sec.title):
+            continue
+        num, ctitle = split_chapter_title(sec.title)
+        body = clean_body_for_tts(sec.text)
+        if num is not None:
+            disp = smart_title(ctitle) if ctitle else ""
+            spoken = build_spoken_heading(num, disp)
+            marker = build_chapter_marker(num, disp)
+            text = spoken + "\n\n" + body if body else spoken
+            out.append(Section(title=marker, text=text))
+        else:
+            out.append(Section(title=smart_title(sec.title), text=body))
+
+    return out if out else [Section("FULL_TEXT", clean_body_for_tts(norm))]
 
 
 # ===================== Chunking =====================
@@ -285,7 +603,8 @@ def chunk_text(t: str, max_chars: int) -> list[Chunk]:
                     buf.append(s)
                     blen += len(s) + 1
                 else:
-                    chunks.append(Chunk(ensure_terminal_punct(" ".join(buf)), 220))
+                    if buf:
+                        chunks.append(Chunk(ensure_terminal_punct(" ".join(buf)), 220))
                     buf, blen = [s], len(s)
             if buf:
                 chunks.append(Chunk(ensure_terminal_punct(" ".join(buf)), 700))
@@ -293,7 +612,7 @@ def chunk_text(t: str, max_chars: int) -> list[Chunk]:
             cur, cur_len = [p], len(p)
 
     flush(700)
-    return chunks
+    return [c for c in chunks if c.text.strip()]
 
 
 # ===================== Chapter splitting (robust Gutenberg) =====================
@@ -461,7 +780,27 @@ def split_into_sections_smart(text: str, min_section_chars: int = 1500) -> list[
 
 # ===================== Piper synthesis =====================
 
-def synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw):
+def _apply_edge_fades(wav_path, fade_ms=10):
+    """Fade the first/last `fade_ms` of a synthesized chunk to silence. Piper's
+    raw output rarely ends on a zero-crossing, so splicing chunks back to back
+    with a straight `ffmpeg -c copy` concat produces an audible click at every
+    boundary; a short fade at each edge makes the cut inaudible. Fades both
+    ends without needing the clip's duration up front (fade-in, reverse,
+    fade-in again, reverse back)."""
+    ff = ffmpeg_path()
+    fade_s = fade_ms / 1000
+    tmp = f"{wav_path}.faded.wav"
+    subprocess.run(
+        [ff, "-y", "-i", str(wav_path),
+         "-af", f"afade=t=in:st=0:d={fade_s},areverse,"
+                f"afade=t=in:st=0:d={fade_s},areverse",
+         "-c:a", "pcm_s16le", tmp],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    os.replace(tmp, wav_path)
+
+
+def synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw, volume=1.0):
     global _WORKER_VOICE, _WORKER_VOICE_MODEL
 
     model_key = str(Path(model).resolve())
@@ -495,18 +834,21 @@ def synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw):
         length_scale=ls,
         noise_scale=ns,
         noise_w_scale=nw,
+        normalize_audio=False,
+        volume=volume,
     )
 
     try:
         with wave.open(str(wav), "wb") as wav_file:
             _WORKER_VOICE.synthesize_wav(text, wav_file, syn_config=syn_config)
+        _apply_edge_fades(wav)
     except Exception as exc:
         raise SynthesisError(f"Piper synthesis failed for chunk '{Path(wav).name}': {exc}") from exc
 
 
 def _synth_worker(job):
-    i, text, model, wav, speaker, ls, ns, nw = job
-    synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw)
+    i, text, model, wav, speaker, ls, ns, nw, volume = job
+    synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw, volume)
     return i, wav
 
 
@@ -607,6 +949,13 @@ def concat_to_mp3(wavs, out_mp3, bitrate, metadata: BookMetadata | None = None,
         
         cmd.append(out_mp3)
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def sanitize_filename(name: str) -> str:
+    """Make a chapter title safe for a filename (keep it readable)."""
+    name = name.replace(":", " -")
+    name = re.sub(r'[\\/*?"<>|]', "", name)
+    return re.sub(r"\s+", " ", name).strip()
 
 
 def write_m3u_playlist(mp3_files: list[tuple[Path, str]], m3u_path: Path):
@@ -763,13 +1112,37 @@ def main():
                     help="Disable chapter splitting")
     ap.add_argument("--audiobook", action="store_true",
                     help="Create m4b audiobook file for Apple Books")
+    ap.add_argument("--intro", choices=["title", "dedication", "note", "none"],
+                    default="title",
+                    help="Spoken opening that replaces the Gutenberg boilerplate/title "
+                         "page/TOC (default: title + author)")
+    ap.add_argument("--also-mp3", action="store_true",
+                    help="In --audiobook mode, also write per-chapter MP3s + .m3u "
+                         "(for the archive.org streaming player) from the same audio")
+    ap.add_argument("--mp3-dir",
+                    help="Directory for per-chapter MP3s (default: <output stem>_mp3)")
     ap.add_argument("--output-pattern")
-    ap.add_argument("--max-chars", type=int, default=3000)
+    ap.add_argument("--max-chars", type=int, default=600,
+                    help="Chunk size in characters (default: 600). Shorter chunks "
+                         "measurably reduce (but don't eliminate) the neural TTS "
+                         "attention/duration-alignment failure mode where a word "
+                         "gets slurred or dropped -- a known general behavior in "
+                         "VITS-style models, worse on longer input sequences.")
     ap.add_argument("--speaker", type=int)
-    ap.add_argument("--length-scale", type=float, default=1.0)
-    ap.add_argument("--noise-scale", type=float, default=0.667)
-    ap.add_argument("--noise-w", type=float, default=0.8)
-    ap.add_argument("--bitrate", default="128k")
+    ap.add_argument("--length-scale", type=float, default=1.20)
+    ap.add_argument("--noise-scale", type=float, default=0.6)
+    ap.add_argument("--noise-w", type=float, default=0.75)
+    ap.add_argument("--volume", type=float, default=1.4,
+                    help="Output gain multiplier applied during synthesis "
+                         "(default: 1.4). Only relevant since normalize_audio "
+                         "is off -- Piper no longer peak-normalizes each chunk, "
+                         "so overall level is quieter than before and this is "
+                         "the way to bring it back up.")
+    ap.add_argument("--bitrate", default="160k",
+                    help="MP3 bitrate (default: 160k). Voices under 32kHz sample "
+                         "rate (most Piper voices, incl. all bundled here) top out "
+                         "at 160k -- MP3's MPEG-2 LSF format has no higher option "
+                         "at that sample rate, so anything above 160k gets clamped.")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--start-page", type=int)
     ap.add_argument("--end-page", type=int)
@@ -779,21 +1152,24 @@ def main():
         inp = require_existing_file(ap, args.input, "input file")
         model_path = require_piper_model_files(ap, args.model)
 
+        with open(f"{model_path}.json", encoding="utf-8") as f:
+            voice_sample_rate = json.load(f).get("audio", {}).get("sample_rate", 22050)
+        args.bitrate = clamp_bitrate_for_sample_rate(args.bitrate, voice_sample_rate)
+
         if inp.suffix.lower() == ".pdf":
             raw_text = read_text_from_pdf(inp, args.start_page, args.end_page)
         else:
             raw_text = read_text_from_txt(inp)
 
-        # Extract metadata before normalizing text
+        # Extract metadata before stripping the Gutenberg header
         metadata = extract_gutenberg_metadata(raw_text)
         if not metadata.title:
             metadata = extract_metadata_from_filename(inp)
 
-        text = normalize_headings(normalize_whitespace(raw_text))
-        text = convert_roman_numerals(text)
-
-        # Always detect chapters for metadata, but may not split output files
-        sections = split_into_sections_smart(text)
+        # Build narration-ready sections: strip PG boilerplate/TOC, give each chapter a
+        # spoken heading + clean marker, clean each body. Roman->number is applied ONLY
+        # to chapter labels here (no destructive global body scan).
+        sections = prepare_sections(raw_text, metadata, intro_mode=args.intro)
 
         base = Path(args.output)
         pattern = args.output_pattern or str(base.with_name(base.stem + "_%03d" + base.suffix))
@@ -821,7 +1197,7 @@ def main():
                         wav = chapter_td / f"p_{i:04d}.wav"
                         jobs.append((i, ch.text, str(model_path), str(wav),
                                      args.speaker, args.length_scale,
-                                     args.noise_scale, args.noise_w))
+                                     args.noise_scale, args.noise_w, args.volume))
 
                     workers = min(args.workers, os.cpu_count() or 8)
                     results = run_synthesis_jobs(jobs, workers)
@@ -838,10 +1214,29 @@ def main():
                 # Create m4b with chapter metadata
                 create_m4b_audiobook(chapter_wavs, m4b_path, args.bitrate, metadata)
 
+                # Optionally emit per-chapter MP3s + m3u from the SAME synthesized WAVs
+                # (no re-synthesis), for the archive.org inline streaming player.
+                if args.also_mp3:
+                    mp3_dir = Path(args.mp3_dir) if args.mp3_dir else \
+                        base.with_name(base.stem + "_mp3")
+                    mp3_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"Writing per-chapter MP3s to: {mp3_dir}")
+                    total = len(chapter_wavs)
+                    generated_mp3s: list[tuple[Path, str]] = []
+                    for idx, (chapter_wav, title) in enumerate(chapter_wavs, 1):
+                        out_mp3 = mp3_dir / f"{idx:02d} - {sanitize_filename(title)}.mp3"
+                        concat_to_mp3([(str(chapter_wav), 0)], str(out_mp3), args.bitrate,
+                                      metadata=metadata, track_num=idx, track_total=total,
+                                      chapter_title=title)
+                        generated_mp3s.append((out_mp3, title))
+                        print(f"  [mp3 {idx}/{total}] {out_mp3.name}")
+                    write_m3u_playlist(generated_mp3s, mp3_dir / f"{base.stem}.m3u")
+
         else:
             # Standard mode: produce MP3 files (one per chapter if split, or single file)
             if not args.split_chapters:
-                sections = [Section("FULL_TEXT", text)]
+                full_text = "\n\n".join(s.text for s in sections)
+                sections = [Section("FULL_TEXT", full_text)]
 
             generated_mp3s: list[tuple[Path, str]] = []
 
@@ -862,7 +1257,7 @@ def main():
                         wav = td / f"p_{i:04d}.wav"
                         jobs.append((i, ch.text, str(model_path), str(wav),
                                      args.speaker, args.length_scale,
-                                     args.noise_scale, args.noise_w))
+                                     args.noise_scale, args.noise_w, args.volume))
 
                     workers = min(args.workers, os.cpu_count() or 8)
                     results = run_synthesis_jobs(jobs, workers)
