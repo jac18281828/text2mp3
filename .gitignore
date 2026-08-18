@@ -11,7 +11,7 @@ models/
 # Book sources and derived text (copyright-sensitive; keep local only)
 *.pdf
 *.html
-Fellowship_of_the_Ring.txt
+The_Fellowship_of_the_Ring.txt
 TheMurderofRogerckroyd_Agatha_Christie.txt
 Who_Goes_There_John_W_Campbell.txt
 Chapter*_sample.txt
@@ -28,3 +28,9 @@ librivox2m4b.py
 render_section.py
 prep_fellowship.py
 test_text2mp3.py
+
+# One-off diagnostic rigs and their output (see exp/)
+exp/
+exp_*.py
+exp_out/
+run_wordcounts.sh

@@ -335,7 +335,13 @@ def strip_scene_breaks(text: str) -> str:
 
 
 def strip_italic_underscores(text: str) -> str:
-    """Remove the underscore characters Gutenberg uses to mark italics (_word_)."""
+    """Remove the underscore characters Gutenberg uses to mark italics (_word_).
+
+    Where the space after a closing marker was lost in conversion ("_boating_on
+    the Brandywine"), deleting the underscore outright would fuse two words into
+    one unpronounceable token, so an underscore between two word characters
+    becomes a space instead."""
+    text = re.sub(r"(?<=\w)_(?=\w)", " ", text)
     return text.replace("_", "")
 
 
@@ -468,7 +474,7 @@ def build_intro(metadata: "BookMetadata", dedication: str | None, mode: str) -> 
     elif mode == "note":
         parts.append("This is a synthetic text-to-speech reading, produced from the "
                      "public-domain Project Gutenberg edition.")
-    return "\n\n".join(parts)
+    return PARA_JOIN.join(parts)
 
 
 def _is_front_matter_title(title: str) -> bool:
@@ -575,9 +581,24 @@ class Chunk:
     pause_ms: int
 
 
+# Paragraphs packed into one chunk are joined with a single newline, never a
+# blank line. A blank line inside the text handed to Piper makes it swallow the
+# word immediately before it -- deterministically, on every repeat, and whatever
+# the punctuation (comma, period, or none). Measured on the Cori voice: three
+# verse lines joined by "\n\n" lost two of their three line-final words 3/3
+# times; the same lines joined by "\n" kept all of them 3/3 times. A single
+# newline still reads as a phrase break, so nothing is lost by using it.
+PARA_JOIN = "\n"
+
+
+def join_paragraphs(t: str) -> str:
+    """Collapse paragraph breaks to the separator Piper handles safely."""
+    return PARA_JOIN.join(p.strip() for p in t.split("\n\n") if p.strip())
+
+
 def chunk_text(t: str, max_chars: int) -> list[Chunk]:
     if len(t) <= max_chars:
-        return [Chunk(ensure_terminal_punct(t), 700)]
+        return [Chunk(ensure_terminal_punct(join_paragraphs(t)), 700)]
 
     paras = [p.strip() for p in t.split("\n\n") if p.strip()]
     chunks, cur, cur_len = [], [], 0
@@ -585,7 +606,7 @@ def chunk_text(t: str, max_chars: int) -> list[Chunk]:
     def flush(pause):
         nonlocal cur, cur_len
         if cur:
-            chunks.append(Chunk(ensure_terminal_punct("\n\n".join(cur)), pause))
+            chunks.append(Chunk(ensure_terminal_punct(PARA_JOIN.join(cur)), pause))
             cur, cur_len = [], 0
 
     for p in paras:
@@ -612,7 +633,12 @@ def chunk_text(t: str, max_chars: int) -> list[Chunk]:
             cur, cur_len = [p], len(p)
 
     flush(700)
-    return [c for c in chunks if c.text.strip()]
+    # Drop chunks with nothing worth speaking: sentence-splitting can strand a
+    # bare punctuation fragment (e.g. a lone closing quote from "...all.'")
+    # as its own "sentence"; ensure_terminal_punct then pads it to something
+    # like "'." -- non-blank, but no actual words, and Piper crashes on it
+    # (writes zero audio frames, never initializes the WAV header).
+    return [c for c in chunks if re.search(r"\w", c.text)]
 
 
 # ===================== Chapter splitting (robust Gutenberg) =====================
@@ -1121,13 +1147,18 @@ def main():
                          "(for the archive.org streaming player) from the same audio")
     ap.add_argument("--mp3-dir",
                     help="Directory for per-chapter MP3s (default: <output stem>_mp3)")
+    ap.add_argument("--title",
+                    help="Book title for the spoken intro and file tags. Overrides "
+                         "whatever is inferred from the Gutenberg header or filename, "
+                         "which loses leading articles and subtitles.")
+    ap.add_argument("--author",
+                    help="Author for the spoken intro and file tags.")
     ap.add_argument("--output-pattern")
     ap.add_argument("--max-chars", type=int, default=600,
-                    help="Chunk size in characters (default: 600). Shorter chunks "
-                         "measurably reduce (but don't eliminate) the neural TTS "
-                         "attention/duration-alignment failure mode where a word "
-                         "gets slurred or dropped -- a known general behavior in "
-                         "VITS-style models, worse on longer input sequences.")
+                    help="Chunk size in characters (default: 600). Larger chunks "
+                         "mean fewer splices; the dropped-word problem this used "
+                         "to trade against was a blank line inside chunk text (see "
+                         "PARA_JOIN), not chunk length, and is fixed at the source.")
     ap.add_argument("--speaker", type=int)
     ap.add_argument("--length-scale", type=float, default=1.20)
     ap.add_argument("--noise-scale", type=float, default=0.6)
@@ -1165,6 +1196,10 @@ def main():
         metadata = extract_gutenberg_metadata(raw_text)
         if not metadata.title:
             metadata = extract_metadata_from_filename(inp)
+        if args.title:
+            metadata.title = args.title
+        if args.author:
+            metadata.author = args.author
 
         # Build narration-ready sections: strip PG boilerplate/TOC, give each chapter a
         # spoken heading + clean marker, clean each body. Roman->number is applied ONLY

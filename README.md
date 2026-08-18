@@ -109,15 +109,32 @@ only need to pass them explicitly if you want something different:
 > clamps anything higher to 160k automatically, so requesting more doesn't
 > do anything.
 >
-> `--max-chars 600` trades a few more chunk splices (invisible now that
-> edges are fade-smoothed) for a real, measured reduction in the rate of
-> the occasional dropped/slurred word neural TTS models are prone to on
-> longer input sequences -- a known general limitation of VITS-style
-> models, not something this pipeline can fully eliminate.
+> `--max-chars` is now a free choice: larger values just mean fewer chunk
+> splices (invisible since chunk edges are fade-smoothed). It used to be a
+> damage-control dial for dropped words, but that turned out to be a
+> distinct bug -- see "Dropped words" below.
 >
 > `--volume 1.4` exists because `normalize_audio` is off by default (it
 > was flattening natural loudness variation across chunks); this brings
 > the level back up without reintroducing that flattening.
+
+---
+
+## Dropped words
+
+Piper swallows the word immediately before a **blank line** in the text it is
+given. It is deterministic, not occasional, and independent of punctuation --
+three verse lines joined by `\n\n` lost two of their three line-final words on
+every repeat, while the same lines joined by `\n` kept all of them.
+
+Chunk assembly therefore packs paragraphs with a single newline (`PARA_JOIN`)
+and never a blank line. This was the real cause of what looked like the
+familiar VITS attention/alignment word-drop, so it is worth ruling out first
+before blaming the model: the giveaway is that every casualty sits at the end
+of a line or short paragraph.
+
+Larger `--max-chars` packs more paragraphs into a chunk, so before the fix it
+made the problem *worse*, not better -- the opposite of the usual intuition.
 
 ---
 
