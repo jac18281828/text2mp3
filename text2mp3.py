@@ -464,10 +464,13 @@ def extract_dedication(text: str) -> str | None:
 def build_intro(metadata: "BookMetadata", dedication: str | None, mode: str) -> str:
     """Compose the spoken opening that replaces the PG boilerplate / title page / TOC."""
     title = smart_title(metadata.title) if metadata.title else "This book"
+    # A title that already ends in punctuation supplies its own sentence break;
+    # appending another period gives "Who Goes There?. By ...".
+    title_stop = "" if title.rstrip().endswith((".", "!", "?")) else "."
     if metadata.author:
-        parts = [f"{title}. By {metadata.author}."]
+        parts = [f"{title}{title_stop} By {metadata.author}."]
     else:
-        parts = [f"{title}."]
+        parts = [f"{title}{title_stop}"]
     if mode == "dedication" and dedication:
         parts.append(dedication)
     elif mode == "note":
@@ -825,6 +828,37 @@ def _apply_edge_fades(wav_path, fade_ms=10):
     os.replace(tmp, wav_path)
 
 
+def _cap_ort_threads(voice, model_key):
+    """Hold each worker to one onnxruntime thread.
+
+    onnxruntime sizes its intra-op thread pool from the core count, so with
+    --workers 8 the machine sees ~64 threads fighting over 16 cores: load
+    average in the high double digits and everything else on the box crawls.
+    OMP_NUM_THREADS does not govern this -- onnxruntime has its own pool, set
+    through SessionOptions, and PiperVoice.load hardcodes a default-constructed
+    SessionOptions with no way to pass one in. So the session is rebuilt here
+    with the cap. Parallelism belongs to --workers, which already runs one
+    process per chunk; a second layer inside each of them only adds contention.
+
+    Costs one extra model load per worker at startup, which is a fraction of a
+    second against a multi-hour render, and workers are reused for the whole run.
+    """
+    threads = int(os.environ.get("TEXT2MP3_ORT_THREADS", "1"))
+    if threads <= 0:
+        return  # 0 or negative: leave onnxruntime to its own defaults
+    try:
+        import onnxruntime
+    except ModuleNotFoundError:
+        return
+
+    opts = onnxruntime.SessionOptions()
+    opts.intra_op_num_threads = threads
+    opts.inter_op_num_threads = 1
+    voice.session = onnxruntime.InferenceSession(
+        model_key, sess_options=opts, providers=["CPUExecutionProvider"]
+    )
+
+
 def synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw, volume=1.0):
     global _WORKER_VOICE, _WORKER_VOICE_MODEL
 
@@ -839,6 +873,7 @@ def synthesize_chunk_with_piper(text, model, wav, speaker, ls, ns, nw, volume=1.
 
         try:
             _WORKER_VOICE = PiperVoice.load(model_key)
+            _cap_ort_threads(_WORKER_VOICE, model_key)
         except FileNotFoundError as exc:
             missing_path = exc.filename or f"{model_key}.json"
             raise SynthesisError(f"Piper model asset not found: {missing_path}") from exc
@@ -1174,9 +1209,18 @@ def main():
                          "at 160k -- MP3's MPEG-2 LSF format has no higher option "
                          "at that sample rate, so anything above 160k gets clamped.")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--ort-threads", type=int, default=1,
+                    help="onnxruntime threads per worker (default: 1). Left to "
+                         "itself onnxruntime sizes this from the core count, so "
+                         "N workers oversubscribe the machine by roughly a factor "
+                         "of the core count. Use 0 to restore that default.")
     ap.add_argument("--start-page", type=int)
     ap.add_argument("--end-page", type=int)
     args = ap.parse_args()
+
+    # Set before any worker is spawned: spawned workers inherit the environment
+    # and read this when they build their onnxruntime session.
+    os.environ["TEXT2MP3_ORT_THREADS"] = str(args.ort_threads)
 
     try:
         inp = require_existing_file(ap, args.input, "input file")
