@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 text2mp3.py — Offline Piper TTS with smart chapter splitting and multiprocessing
-Target: macOS Apple Silicon (M3 Max safe)
 
 Recommended run:
   OMP_NUM_THREADS=1 python3 text2mp3.py ... --workers 6 --split-chapters
