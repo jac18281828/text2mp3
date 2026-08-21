@@ -269,8 +269,17 @@ _SMALL_WORDS = {
 
 
 def _cap_token(w: str) -> str:
-    """Capitalize first letter, leave the rest (so possessives stay 'King's', not 'King'S')."""
-    return (w[:1].upper() + w[1:]) if w else w
+    """Capitalize the first letter, leave the rest (so possessives stay 'King's',
+    not 'King'S').
+
+    The first *character* is not always the first letter: a title may open on a
+    quote or a bracket, and upper-casing that leaves the word itself untouched
+    -- 'The Letter Signed “Bella”' came back as '...Signed “bella”'. So the
+    scan runs to the first alphabetic character instead."""
+    for i, c in enumerate(w):
+        if c.isalpha():
+            return w[:i] + c.upper() + w[i + 1:]
+    return w
 
 
 def smart_title(s: str) -> str:
