@@ -10,9 +10,12 @@ Covers the three bug classes from the fix request plus the extras found in the s
 
 Run:  .venv/bin/python test_text2mp3.py
 """
+import os
+
 import text2mp3 as T
 
 _failures = []
+_skipped = []
 
 
 def check(label, got, want):
@@ -77,6 +80,12 @@ def test_chapter_headings():
     check("smart_title quoted last word", T.smart_title("THE LETTER SIGNED “BELLA”"),
           "The Letter Signed “Bella”")
     check("smart_title fully quoted", T.smart_title("“SAVE HIM!”"), "“Save Him!”")
+    # Leading punctuation is skipped to find the first letter; leading digits are
+    # not, or "19th" comes back "19Th".
+    check("smart_title ordinal", T.smart_title("THE 19TH CENTURY"), "The 19th Century")
+    check("smart_title digit-hyphen", T.smart_title("A 3-DAY JOURNEY"), "A 3-day Journey")
+    # No alphabetic character at all: nothing to capitalize, hand it back as-is.
+    check("smart_title digits only", T.smart_title("1923"), "1923")
 
 
 # ---------- 3. literal markers: scene breaks, decoration, illustrations, boilerplate ----------
@@ -176,9 +185,12 @@ def test_dedication():
 # ---------- end-to-end on the real file (if present) ----------
 
 def test_real_file_end_to_end():
-    import os
     path = "TheMurderofRogerckroyd_Agatha_Christie.txt"
     if not os.path.exists(path):
+        # The book text is deliberately not in the repo. Say so out loud: a
+        # silent return leaves "all 11 test groups passed" claiming coverage
+        # this run never had.
+        _skipped.append(f"{path} not present")
         return
     raw = open(path, encoding="utf-8", errors="ignore").read()
     meta = T.extract_gutenberg_metadata(raw)
@@ -206,7 +218,11 @@ def main():
         for f in _failures:
             print("  ✗ " + f)
         raise SystemExit(1)
-    print(f"OK — all {total} test groups passed.")
+    for reason in _skipped:
+        print(f"  skipped: {reason}")
+    ran = total - len(_skipped)
+    print(f"OK — {ran} of {total} test groups passed"
+          + (f", {len(_skipped)} skipped." if _skipped else "."))
 
 
 if __name__ == "__main__":

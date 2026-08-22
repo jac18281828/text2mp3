@@ -273,12 +273,20 @@ def _cap_token(w: str) -> str:
     not 'King'S').
 
     The first *character* is not always the first letter: a title may open on a
-    quote or a bracket, and upper-casing that leaves the word itself untouched
-    -- 'The Letter Signed “Bella”' came back as '...Signed “bella”'. So the
-    scan runs to the first alphabetic character instead."""
+    quote, a bracket or a dash, and upper-casing that leaves the word itself
+    untouched -- 'The Letter Signed “Bella”' came back as '...Signed “bella”'.
+    So leading punctuation is skipped.
+
+    Only punctuation, though. Skipping every non-letter would walk past leading
+    digits too and capitalize the letter it landed on, turning '19th' into
+    '19Th' and '42nd' into '42Nd'. A token that starts on a digit has no first
+    letter to capitalize and is left exactly as it is."""
     for i, c in enumerate(w):
-        if c.isalpha():
-            return w[:i] + c.upper() + w[i + 1:]
+        if not c.isalnum():
+            continue          # leading quote, bracket, dash
+        if not c.isalpha():
+            return w          # leading digit: '19th' stays '19th'
+        return w[:i] + c.upper() + w[i + 1:]
     return w
 
 
