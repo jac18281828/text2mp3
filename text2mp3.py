@@ -279,13 +279,15 @@ def _cap_token(w: str) -> str:
 
     Only punctuation, though. Skipping every non-letter would walk past leading
     digits too and capitalize the letter it landed on, turning '19th' into
-    '19Th' and '42nd' into '42Nd'. A token that starts on a digit has no first
-    letter to capitalize and is left exactly as it is."""
+    '19Th' and '42nd' into '42Nd'. So the scan stops at the first alphanumeric
+    character, and a token whose first alphanumeric is not a letter -- a digit,
+    or one of the Unicode numeral glyphs like 'ⅷ' that are alnum but not alpha
+    -- has no first letter to capitalize and is left exactly as it is."""
     for i, c in enumerate(w):
         if not c.isalnum():
             continue          # leading quote, bracket, dash
         if not c.isalpha():
-            return w          # leading digit: '19th' stays '19th'
+            return w          # opens on a numeral: '19th' stays '19th'
         return w[:i] + c.upper() + w[i + 1:]
     return w
 
