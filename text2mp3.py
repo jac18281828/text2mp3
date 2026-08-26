@@ -1367,7 +1367,7 @@ def main():
                                   metadata=metadata,
                                   track_num=idx,
                                   track_total=len(sections),
-                                  chapter_title=sec.title)
+                                  chapter_title=sec.title if args.split_chapters else None)
 
                 generated_mp3s.append((out_mp3, sec.title))
 
