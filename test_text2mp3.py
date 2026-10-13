@@ -10,7 +10,10 @@ Covers the three bug classes from the fix request plus the extras found in the s
 
 Run:  .venv/bin/python test_text2mp3.py
 """
+import contextlib
 import os
+import tempfile
+from pathlib import Path
 
 import text2mp3 as T
 
@@ -256,56 +259,79 @@ def _touch_voice(folder, name, config=True):
         open(os.path.join(folder, f"{name}.onnx.json"), "w").close()
 
 
-def test_voice_resolution():
-    import tempfile
-    from pathlib import Path
+@contextlib.contextmanager
+def _voice_fixture():
+    """Temp voices folders (PIPER_VOICES, XDG, home default) each holding `v1`,
+    plus a working directory. Yields a namespace of the paths."""
+    class Fx:
+        pass
     with tempfile.TemporaryDirectory() as td:
-        piper = os.path.join(td, "piper")
-        xdg = os.path.join(td, "xdg")
-        home = os.path.join(td, "home")
-        work = os.path.join(td, "work")
-        os.makedirs(work)
-        home_dir = os.path.join(home, ".local", "share", "piper", "voices")
-        xdg_dir = os.path.join(xdg, "piper", "voices")
-        for d in (piper, xdg_dir, home_dir):
+        fx = Fx()
+        fx.piper = os.path.join(td, "piper")
+        fx.xdg = os.path.join(td, "xdg")
+        fx.home = os.path.join(td, "home")
+        fx.work = os.path.join(td, "work")
+        fx.xdg_dir = os.path.join(fx.xdg, "piper", "voices")
+        fx.home_dir = os.path.join(fx.home, ".local", "share", "piper", "voices")
+        os.makedirs(fx.work)
+        for d in (fx.piper, fx.xdg_dir, fx.home_dir):
             _touch_voice(d, "v1")
+        yield fx
 
-        # folder precedence: PIPER_VOICES, then XDG_DATA_HOME, then home default
-        env = {"PIPER_VOICES": piper, "XDG_DATA_HOME": xdg, "HOME": home}
-        check("PIPER_VOICES first", _resolve("v1", env, work),
-              Path(piper) / "v1.onnx")
+
+def test_voice_folder_precedence():
+    with _voice_fixture() as fx:
+        env = {"PIPER_VOICES": fx.piper, "XDG_DATA_HOME": fx.xdg, "HOME": fx.home}
+        check("PIPER_VOICES first", _resolve("v1", env, fx.work),
+              Path(fx.piper) / "v1.onnx")
         del env["PIPER_VOICES"]
-        check("XDG_DATA_HOME second", _resolve("v1", env, work),
-              Path(xdg_dir) / "v1.onnx")
+        check("XDG_DATA_HOME second", _resolve("v1", env, fx.work),
+              Path(fx.xdg_dir) / "v1.onnx")
         del env["XDG_DATA_HOME"]
-        check("home default last", _resolve("v1", env, work),
-              Path(home_dir) / "v1.onnx")
+        check("home default last", _resolve("v1", env, fx.work),
+              Path(fx.home_dir) / "v1.onnx")
 
-        # a bare name and name.onnx both resolve under the folder
-        env = {"PIPER_VOICES": piper}
-        check("bare name", _resolve("v1", env, work), Path(piper) / "v1.onnx")
-        check("name.onnx", _resolve("v1.onnx", env, work), Path(piper) / "v1.onnx")
 
-        # an existing path wins over a same-named voice
-        _touch_voice(work, "v1")
-        check("bare file in cwd wins", _resolve("v1.onnx", env, work),
+def test_voice_name_forms():
+    with _voice_fixture() as fx:
+        env = {"PIPER_VOICES": fx.piper}
+        check("bare name", _resolve("v1", env, fx.work),
+              Path(fx.piper) / "v1.onnx")
+        check("name.onnx", _resolve("v1.onnx", env, fx.work),
+              Path(fx.piper) / "v1.onnx")
+
+
+def test_existing_path_wins():
+    with _voice_fixture() as fx:
+        env = {"PIPER_VOICES": fx.piper}
+        _touch_voice(fx.work, "v1")
+        check("bare file in cwd wins", _resolve("v1.onnx", env, fx.work),
               Path("v1.onnx"))
-        local = os.path.join(work, "v1.onnx")
-        check("explicit path wins", _resolve(local, env, work), Path(local))
+        local = os.path.join(fx.work, "v1.onnx")
+        check("explicit path wins", _resolve(local, env, fx.work), Path(local))
 
-        # a missing voice or a missing config fails, naming the path tried
-        got = _resolve("nope", env, work)
+
+def test_voice_resolution_failures():
+    with _voice_fixture() as fx:
+        env = {"PIPER_VOICES": fx.piper}
+        folder_note = f"voices folder: {fx.piper}"
+        got = _resolve("nope", env, fx.work)
         check_true("missing voice fails", _is_error(got))
         check_true("missing voice names path",
-                   _is_error(got) and str(Path(piper) / "nope.onnx") in got
-                   and piper in got)
-        _touch_voice(piper, "noconf", config=False)
-        got = _resolve("noconf", env, work)
+                   _is_error(got) and str(Path(fx.piper) / "nope.onnx") in got)
+        check_true("missing voice names folder",
+                   _is_error(got) and folder_note in got)
+        _touch_voice(fx.piper, "noconf", config=False)
+        got = _resolve("noconf", env, fx.work)
         check_true("missing config fails", _is_error(got))
         check_true("missing config names path",
-                   _is_error(got) and str(Path(piper) / "noconf.onnx.json") in got)
-        got = _resolve(os.path.join(work, "gone.onnx"), env, work)
-        check_true("missing path keeps message", _is_error(got) and "model file not found" in got)
+                   _is_error(got)
+                   and str(Path(fx.piper) / "noconf.onnx.json") in got)
+        check_true("missing config names folder",
+                   _is_error(got) and folder_note in got)
+        got = _resolve(os.path.join(fx.work, "gone.onnx"), env, fx.work)
+        check_true("missing path keeps message",
+                   _is_error(got) and "model file not found" in got)
 
 
 def main():

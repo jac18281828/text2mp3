@@ -86,22 +86,26 @@ def piper_voices_dir() -> Path:
     return base / "piper" / "voices"
 
 
+def resolve_voice_name(parser: argparse.ArgumentParser, value: str) -> Path:
+    """Resolve a voice name, with or without .onnx, flat in the voices folder."""
+    folder = piper_voices_dir()
+    name = value[:-len(".onnx")] if value.endswith(".onnx") else value
+    model_path = folder / f"{name}.onnx"
+    if not model_path.is_file():
+        parser.error(f"voice '{name}' not found: {model_path} "
+                     f"(voices folder: {folder})")
+    config_path = Path(f"{model_path}.json")
+    if not config_path.is_file():
+        parser.error(f"voice config not found: {config_path} "
+                     f"(voices folder: {folder})")
+    return model_path
+
+
 def require_piper_model_files(parser: argparse.ArgumentParser, value: str) -> Path:
-    """Resolve -m. An existing file is a path. Any other value without a path
-    separator is a voice name, looked up flat in the shared voices folder."""
+    """An existing file is a path; any other separator-free value is a voice name."""
     is_bare = not any(sep and sep in value for sep in (os.sep, os.altsep))
     if is_bare and not Path(value).is_file():
-        folder = piper_voices_dir()
-        name = value[:-len(".onnx")] if value.endswith(".onnx") else value
-        model_path = folder / f"{name}.onnx"
-        if not model_path.is_file():
-            parser.error(f"voice '{name}' not found: {model_path} "
-                         f"(voices folder: {folder})")
-        config_path = Path(f"{model_path}.json")
-        if not config_path.is_file():
-            parser.error(f"voice config not found: {config_path} "
-                         f"(voices folder: {folder})")
-        return model_path
+        return resolve_voice_name(parser, value)
     model_path = require_existing_file(parser, value, "model file")
     config_path = Path(f"{model_path}.json")
     if not config_path.exists():
