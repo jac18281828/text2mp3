@@ -75,7 +75,33 @@ def require_existing_file(parser: argparse.ArgumentParser, value: str, label: st
     return path
 
 
+def piper_voices_dir() -> Path:
+    """The Piper-wide voices folder: PIPER_VOICES, else
+    $XDG_DATA_HOME/piper/voices, else ~/.local/share/piper/voices."""
+    explicit = os.environ.get("PIPER_VOICES")
+    if explicit:
+        return Path(explicit)
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return base / "piper" / "voices"
+
+
 def require_piper_model_files(parser: argparse.ArgumentParser, value: str) -> Path:
+    """Resolve -m. An existing file is a path. Any other value without a path
+    separator is a voice name, looked up flat in the shared voices folder."""
+    is_bare = not any(sep and sep in value for sep in (os.sep, os.altsep))
+    if is_bare and not Path(value).is_file():
+        folder = piper_voices_dir()
+        name = value[:-len(".onnx")] if value.endswith(".onnx") else value
+        model_path = folder / f"{name}.onnx"
+        if not model_path.is_file():
+            parser.error(f"voice '{name}' not found: {model_path} "
+                         f"(voices folder: {folder})")
+        config_path = Path(f"{model_path}.json")
+        if not config_path.is_file():
+            parser.error(f"voice config not found: {config_path} "
+                         f"(voices folder: {folder})")
+        return model_path
     model_path = require_existing_file(parser, value, "model file")
     config_path = Path(f"{model_path}.json")
     if not config_path.exists():

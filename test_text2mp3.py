@@ -208,6 +208,106 @@ def test_real_file_end_to_end():
     check_true("I'd intact", "I’d just like to satisfy myself" in alltext)
 
 
+# ---------- -m voice-name resolution ----------
+
+class _ParserError(Exception):
+    pass
+
+
+class _RaisingParser:
+    """Stands in for argparse: error() raises with the message."""
+    def error(self, message):
+        raise _ParserError(message)
+
+
+def _resolve(value, env, cwd=None):
+    """Run require_piper_model_files under a patched environment; return the
+    resolved path, or the parser error message."""
+    keys = ("PIPER_VOICES", "XDG_DATA_HOME", "HOME")
+    saved = {k: os.environ.get(k) for k in keys}
+    old_cwd = os.getcwd()
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        if cwd:
+            os.chdir(cwd)
+        try:
+            return T.require_piper_model_files(_RaisingParser(), value)
+        except _ParserError as e:
+            return f"ERROR: {e}"
+    finally:
+        os.chdir(old_cwd)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _is_error(got):
+    return isinstance(got, str) and got.startswith("ERROR:")
+
+
+def _touch_voice(folder, name, config=True):
+    os.makedirs(folder, exist_ok=True)
+    open(os.path.join(folder, f"{name}.onnx"), "w").close()
+    if config:
+        open(os.path.join(folder, f"{name}.onnx.json"), "w").close()
+
+
+def test_voice_resolution():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as td:
+        piper = os.path.join(td, "piper")
+        xdg = os.path.join(td, "xdg")
+        home = os.path.join(td, "home")
+        work = os.path.join(td, "work")
+        os.makedirs(work)
+        home_dir = os.path.join(home, ".local", "share", "piper", "voices")
+        xdg_dir = os.path.join(xdg, "piper", "voices")
+        for d in (piper, xdg_dir, home_dir):
+            _touch_voice(d, "v1")
+
+        # folder precedence: PIPER_VOICES, then XDG_DATA_HOME, then home default
+        env = {"PIPER_VOICES": piper, "XDG_DATA_HOME": xdg, "HOME": home}
+        check("PIPER_VOICES first", _resolve("v1", env, work),
+              Path(piper) / "v1.onnx")
+        del env["PIPER_VOICES"]
+        check("XDG_DATA_HOME second", _resolve("v1", env, work),
+              Path(xdg_dir) / "v1.onnx")
+        del env["XDG_DATA_HOME"]
+        check("home default last", _resolve("v1", env, work),
+              Path(home_dir) / "v1.onnx")
+
+        # a bare name and name.onnx both resolve under the folder
+        env = {"PIPER_VOICES": piper}
+        check("bare name", _resolve("v1", env, work), Path(piper) / "v1.onnx")
+        check("name.onnx", _resolve("v1.onnx", env, work), Path(piper) / "v1.onnx")
+
+        # an existing path wins over a same-named voice
+        _touch_voice(work, "v1")
+        check("bare file in cwd wins", _resolve("v1.onnx", env, work),
+              Path("v1.onnx"))
+        local = os.path.join(work, "v1.onnx")
+        check("explicit path wins", _resolve(local, env, work), Path(local))
+
+        # a missing voice or a missing config fails, naming the path tried
+        got = _resolve("nope", env, work)
+        check_true("missing voice fails", _is_error(got))
+        check_true("missing voice names path",
+                   _is_error(got) and str(Path(piper) / "nope.onnx") in got
+                   and piper in got)
+        _touch_voice(piper, "noconf", config=False)
+        got = _resolve("noconf", env, work)
+        check_true("missing config fails", _is_error(got))
+        check_true("missing config names path",
+                   _is_error(got) and str(Path(piper) / "noconf.onnx.json") in got)
+        got = _resolve(os.path.join(work, "gone.onnx"), env, work)
+        check_true("missing path keeps message", _is_error(got) and "model file not found" in got)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

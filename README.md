@@ -34,11 +34,16 @@ Install dependencies:
 pip install piper-tts onnxruntime imageio-ffmpeg pypdf
 ```
 
-Download a Piper voice model (example):
+Piper voices live in one shared folder, flat: `<name>.onnx` beside
+`<name>.onnx.json`. The folder is `$PIPER_VOICES` if set, else
+`$XDG_DATA_HOME/piper/voices`, else `~/.local/share/piper/voices`.
 
 ```text
-models/en_GB-alan-medium.onnx
+~/.local/share/piper/voices/en_GB-alan-medium.onnx
+~/.local/share/piper/voices/en_GB-alan-medium.onnx.json
 ```
+
+`-m en_GB-alan-medium` selects that voice. A path to a `.onnx` file still works.
 
 Voice models are available from:  
 https://github.com/rhasspy/piper
@@ -56,7 +61,7 @@ Works especially well with Project Gutenberg texts.
 ```bash
 python3 text2mp3.py \
   -i The_Man_Eaters_of_Tsavo.txt \
-  -m models/en_GB-alan-medium.onnx \
+  -m en_GB-alan-medium \
   -o The_Man_Eaters_of_Tsavo_alan_Piper.mp3
 ```
 
@@ -69,7 +74,7 @@ python3 text2mp3.py \
   -i Who_Goes_There.pdf \
   --start-page 1 \
   --end-page 5 \
-  -m models/en_GB-alan-medium.onnx \
+  -m en_GB-alan-medium \
   -o Who_Goes_There_excerpt.mp3
 ```
 
